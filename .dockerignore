@@ -1,0 +1,13 @@
+node_modules
+frontend/node_modules
+backend/node_modules
+frontend/dist
+backend/public
+.git
+.npm-cache
+.env
+.env.local
+backend/.env
+frontend/.env
+*.log
+README.md
