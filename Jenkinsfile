@@ -11,8 +11,7 @@ pipeline {
     IMAGE_NAME = 'kerala-ayalkootam-manager'
     IMAGE_TAG = "${env.BUILD_NUMBER}"
     DOCKER_BUILDKIT = '1'
-    APP_PORT = '80'
-    CONTAINER_PORT = '5000'
+    K8S_NAMESPACE = 'ayalkootam'
   }
 
   stages {
@@ -56,46 +55,53 @@ pipeline {
 
     stage('Docker Build') {
       steps {
-        sh 'docker build -t ${IMAGE_NAME}:${IMAGE_TAG} -t ${IMAGE_NAME}:latest .'
+        sh '''
+          test -n "$DOCKER_REGISTRY" || (echo "DOCKER_REGISTRY is required for Kubernetes deploy" && exit 1)
+          docker build \
+            -t ${IMAGE_NAME}:${IMAGE_TAG} \
+            -t ${IMAGE_NAME}:latest \
+            -t ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} \
+            -t ${DOCKER_REGISTRY}/${IMAGE_NAME}:latest \
+            .
+        '''
       }
     }
 
-    stage('Deploy on EC2') {
+    stage('Docker Push') {
       steps {
-        withCredentials([
-          string(credentialsId: 'mongo-uri', variable: 'MONGO_URI'),
-          string(credentialsId: 'jwt-secret', variable: 'JWT_SECRET')
-        ]) {
+        withCredentials([usernamePassword(credentialsId: 'docker-registry-credentials', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
           sh '''
-            docker stop ${APP_NAME} || true
-            docker rm ${APP_NAME} || true
-            docker run -d \
-              --name ${APP_NAME} \
-              --restart unless-stopped \
-              -p ${APP_PORT}:${CONTAINER_PORT} \
-              -e NODE_ENV=production \
-              -e PORT=${CONTAINER_PORT} \
-              -e MONGO_URI="${MONGO_URI}" \
-              -e JWT_SECRET="${JWT_SECRET}" \
-              -e CLIENT_URL="${CLIENT_URL:-http://localhost}" \
-              ${IMAGE_NAME}:latest
+            echo "$DOCKER_PASS" | docker login "$DOCKER_REGISTRY" -u "$DOCKER_USER" --password-stdin
+            docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
+            docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}:latest
           '''
         }
       }
     }
 
-    stage('Docker Push Optional') {
-      when {
-        expression { return env.DOCKER_REGISTRY?.trim() }
-      }
+    stage('Deploy to Kubernetes') {
       steps {
-        withCredentials([usernamePassword(credentialsId: 'docker-registry-credentials', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+        withCredentials([
+          file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG'),
+          string(credentialsId: 'mongo-uri', variable: 'MONGO_URI'),
+          string(credentialsId: 'jwt-secret', variable: 'JWT_SECRET')
+        ]) {
           sh '''
-            echo "$DOCKER_PASS" | docker login "$DOCKER_REGISTRY" -u "$DOCKER_USER" --password-stdin
-            docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
-            docker tag ${IMAGE_NAME}:latest ${DOCKER_REGISTRY}/${IMAGE_NAME}:latest
-            docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
-            docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}:latest
+            export FULL_IMAGE=${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
+            kubectl create namespace ${K8S_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+
+            kubectl -n ${K8S_NAMESPACE} create secret generic ayalkootam-secrets \
+              --from-literal=MONGO_URI="${MONGO_URI}" \
+              --from-literal=JWT_SECRET="${JWT_SECRET}" \
+              --dry-run=client -o yaml | kubectl apply -f -
+
+            sed \
+              -e "s#IMAGE_PLACEHOLDER#${FULL_IMAGE}#g" \
+              -e "s#CLIENT_URL_PLACEHOLDER#${CLIENT_URL:-http://localhost}#g" \
+              k8s/deployment.yaml | kubectl -n ${K8S_NAMESPACE} apply -f -
+
+            kubectl -n ${K8S_NAMESPACE} apply -f k8s/service.yaml
+            kubectl -n ${K8S_NAMESPACE} rollout status deployment/${APP_NAME} --timeout=180s
           '''
         }
       }
@@ -104,7 +110,7 @@ pipeline {
 
   post {
     success {
-      echo "EC2 deployment completed successfully for ${env.APP_NAME}"
+      echo "Kubernetes deployment completed successfully for ${env.APP_NAME}"
     }
     failure {
       echo 'Pipeline failed. Check the stage logs above.'
