@@ -1,17 +1,28 @@
-# Jenkins CI/CD Setup for EC2
+# Jenkins CI/CD Setup for Kubernetes on EC2
 
-This project includes a `Jenkinsfile` designed for Jenkins running on an Ubuntu EC2 instance.
+This project now deploys to Kubernetes from Jenkins running on an Ubuntu EC2 instance.
+
+## Deployment Flow
+
+1. Jenkins checks out the GitHub repo.
+2. Installs backend and frontend dependencies.
+3. Runs backend JavaScript syntax checks.
+4. Builds the frontend.
+5. Builds a Docker image.
+6. Pushes the Docker image to a registry.
+7. Creates/updates Kubernetes secrets.
+8. Applies Kubernetes deployment and service manifests.
+9. Waits for Kubernetes rollout to complete.
 
 ## EC2 Requirements
 
-Install Git, Node.js, Docker, and Jenkins on the EC2 instance.
+Install Git, Node.js, Docker, Java, Jenkins, and kubectl on the EC2 instance.
 
 ```bash
 sudo apt update
 sudo apt install -y git docker.io fontconfig openjdk-17-jre
 sudo systemctl enable docker
 sudo systemctl start docker
-sudo usermod -aG docker ubuntu
 ```
 
 Install Node.js 22:
@@ -23,6 +34,15 @@ node -v
 npm -v
 ```
 
+Install kubectl:
+
+```bash
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+chmod +x kubectl
+sudo mv kubectl /usr/local/bin/kubectl
+kubectl version --client
+```
+
 Allow Jenkins to use Docker:
 
 ```bash
@@ -30,33 +50,40 @@ sudo usermod -aG docker jenkins
 sudo systemctl restart jenkins
 ```
 
-If Docker permission still fails, reboot EC2:
+If Docker permission still fails:
 
 ```bash
 sudo reboot
 ```
 
+## Kubernetes Cluster
+
+You need a working Kubernetes cluster reachable from Jenkins. This can be:
+
+- Minikube on EC2
+- kubeadm cluster
+- Amazon EKS
+- Any external Kubernetes cluster
+
+Jenkins must have a valid kubeconfig for that cluster.
+
 ## AWS Security Group
 
-Open inbound rules:
+For Jenkins and NodePort testing, open:
 
 ```text
-22   SSH
-80   HTTP
-8080 Jenkins
+22     SSH
+8080   Jenkins
+30080  Kubernetes NodePort app access
 ```
 
-After setup, your app will run on:
+The app will be reachable at:
 
 ```text
-http://YOUR_EC2_PUBLIC_IP
+http://YOUR_EC2_PUBLIC_IP:30080
 ```
 
-Jenkins usually runs on:
-
-```text
-http://YOUR_EC2_PUBLIC_IP:8080
-```
+If you later use an Ingress or LoadBalancer, expose port `80` instead.
 
 ## Jenkins Credentials
 
@@ -78,11 +105,21 @@ ID: jwt-secret
 Secret: any-long-random-secret
 ```
 
-Optional Docker registry credentials:
+### Docker Registry Credentials
 
 ```text
 Kind: Username with password
 ID: docker-registry-credentials
+Username: your Docker registry username
+Password: your Docker registry token/password
+```
+
+### Kubernetes Kubeconfig
+
+```text
+Kind: Secret file
+ID: kubeconfig
+File: your kubeconfig file
 ```
 
 ## Jenkins Job Setup
@@ -110,52 +147,63 @@ Jenkinsfile
 
 ## Jenkins Environment Variables
 
-In the Jenkins job configuration, add:
+Set these in the Jenkins job:
 
 ```text
-CLIENT_URL=http://YOUR_EC2_PUBLIC_IP
+DOCKER_REGISTRY=docker.io/YOUR_DOCKERHUB_USERNAME
+CLIENT_URL=http://YOUR_EC2_PUBLIC_IP:30080
+K8S_NAMESPACE=ayalkootam
 ```
 
-Optional:
+For Amazon ECR, `DOCKER_REGISTRY` will look different, for example:
 
 ```text
-APP_PORT=80
-CONTAINER_PORT=5000
-DOCKER_REGISTRY=your-registry.example.com
+DOCKER_REGISTRY=123456789012.dkr.ecr.ap-south-1.amazonaws.com
 ```
 
-## Pipeline Stages
+## Kubernetes Files
 
-1. Checkout code
-2. Install backend dependencies
-3. Install frontend dependencies
-4. Backend JavaScript syntax check
-5. Frontend production build with `/api`
-6. Docker image build
-7. Stop old app container
-8. Start new app container on EC2 port 80
-9. Optional Docker registry push
+The repo includes:
+
+```text
+k8s/deployment.yaml
+k8s/service.yaml
+```
+
+The Jenkinsfile replaces `IMAGE_PLACEHOLDER` with the pushed Docker image tag during deployment.
 
 ## MongoDB Atlas
 
-In MongoDB Atlas Network Access, allow your EC2 public IP.
+In MongoDB Atlas Network Access, allow your Kubernetes node/EC2 public IP.
 
-For testing only, you can temporarily allow:
+For testing only:
 
 ```text
 0.0.0.0/0
 ```
 
-## Manual Docker Run
+## Useful Commands
+
+Check pods:
 
 ```bash
-docker run -d --name kerala-ayalkootam-manager \
-  --restart unless-stopped \
-  -p 80:5000 \
-  -e NODE_ENV=production \
-  -e PORT=5000 \
-  -e MONGO_URI="mongodb+srv://USERNAME:PASSWORD@YOUR_CLUSTER.mongodb.net/ayalkootam" \
-  -e JWT_SECRET="change-this-secret" \
-  -e CLIENT_URL="http://YOUR_EC2_PUBLIC_IP" \
-  kerala-ayalkootam-manager:latest
+kubectl -n ayalkootam get pods
+```
+
+Check service:
+
+```bash
+kubectl -n ayalkootam get svc
+```
+
+View app logs:
+
+```bash
+kubectl -n ayalkootam logs deployment/kerala-ayalkootam-manager
+```
+
+Restart deployment:
+
+```bash
+kubectl -n ayalkootam rollout restart deployment/kerala-ayalkootam-manager
 ```
